@@ -1,0 +1,913 @@
+---
+title: "Song popularity prediction"
+output:
+  pdf_document: default
+  word_document: default
+  fontsize: 11pt
+  header-includes:
+    - \usepackage{geometry,amsmath}
+    - \usepackage{titling}
+    - \usepackage{hyperref}
+    - \usepackage[numbers,sort&compress]{natbib}
+  extra_dependencies:
+    - \usepackage{setspace}
+    - \onehalfspacing
+    - \pagenumbering{gobble}
+    - \def\equationautorefname~#1\null{Equation (#1)\null}
+  geometry:
+    - left=25mm
+    - right=25mm
+    - bottom=35mm
+    - top=30mm
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.path = "figs/", dpi = 300, dev = "png")
+knitr::opts_knit$set(root.dir = "C:/Users/Elise/OneDrive/Bureau/MSc data analytics/Statistical machine learning/data")
+```
+
+```{r library, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(GGally)
+library(naniar)
+library(patchwork)
+library(mice)
+library(car)
+library(e1071)
+library(future)
+library(doFuture)
+library(finetune)
+library(magrittr)
+library(stacks)
+library(DALEXtra)
+library(tidymodels)
+
+# defining a seed for the rest of the document
+seed <- 202566346
+
+```
+
+# Exploratory data analysis
+
+We first import the dataset.
+
+```{r import}
+data <- read.csv("Song_reduced.csv")|>
+  select(-binomial)
+```
+
+The data is made of `r nrow(data)` rows and `r ncol(data)` columns (the name of the song, the popularity of the song and `r ncol(data)-2` audio features).
+
+Descriptive summary statistics were first computed on the continuous numerical variables.
+
+
+```{r descritpive_stats_cont}
+num.data <- data |> select(-c(song_name, Audio_mode, Key, Time_signature))
+
+stats <- data.frame(
+  Mean = round(sapply(num.data, mean, na.rm = TRUE),2),
+  `Standard deviation` = round(sapply(num.data, sd, na.rm = TRUE),2),
+  Minimum = round(sapply(num.data, min, na.rm = TRUE),2),
+  `First quartile` = round(sapply(num.data, quantile, 0.25, na.rm = TRUE),2),
+  Median = round(sapply(num.data, median, na.rm = TRUE),2),
+  `Third quartile` = round(sapply(num.data, quantile, 0.75, na.rm = TRUE),2),
+  Maximum = round(sapply(num.data, max, na.rm = TRUE),2)
+)
+
+knitr::kable(stats)
+
+```
+
+The table above presents key summary statistics over all continuous numerical variables in the dataset (all variables except song name, audio mode, key and time signature). 
+
+The target variable in our analysis (song popularity) ranges from 0 to 100, with a mean around 53 and a median around 55. There are no values outside the range that was defined in the variable description, this variable does not require cleaning.
+
+According to the presentation of the dataset, `Acousticness` has been defined to range between 0 and 1. However, as is presented in this table, the dataset has values for `Acousticness` outside of this range (the minimum is negative and the maximum is 1.98). This variable will have to be cleaned. The variable `Duration_ms` also has unlikely values : its minimum is negative, which is impossible for a song and its maximum is around 30 minutes (there might be 30 minutes songs but that seems unlikely, especially as this is much higher than the third quartile, this will have to be investigated further in the cleaning process). The feature `Tempo` will also require cleaning, as its minimum is negative and its maximum is around four beats per second, which is high. There are no other values that are out of the bounds that were defined in the dataset decsription.
+
+The table above also shows that a lot of the numerical variables are skewed (as their medians are different from their means). In particular, `Acousticness`, `Instrumentalness`, `Liveness` and `Speechiness` are heavily left skewed. `Energy` and `Loudness` might also be slightly right-skewed.
+
+Correlations between numerical variables were then examined. A full correlation matrix was first calculated, before the ten highest correlations (in absolute values) were retained.
+
+```{r corr, warning=FALSE, message=FALSE}
+cor_matrix <- cor(data |> select(-c(song_name, Key, Time_signature)), use = "pairwise.complete.obs")
+
+highest_cor <- as_tibble(cor_matrix, rownames="Var1") |>
+  pivot_longer(cols=-Var1, names_to="Var2", values_to="Correlation_coefficient") |>
+  filter(Var1 != Var2) |>
+  mutate(abs_corr=abs(Correlation_coefficient)) |>
+  arrange(desc(abs_corr)) |>
+  distinct(Correlation_coefficient, .keep_all=TRUE) |>
+  slice_head(n=10) |>
+  select(Var1, Var2, Correlation_coefficient)
+
+knitr::kable(highest_cor)
+
+```
+
+The table above shows the ten highest correlation coefficients in the dataset. `Energy`, `Loudness` and `Acousticness` are all very correlated. `Audio_valence` is also correlated with a lot of other predictors in the dataset, even though those correlation are not very strong. `song_popularity`, the target variable is not strongly correlated with any variable (the highest correlation between `song_popularity` and other variables is with `Instrumentalness`, at only -0.13)
+
+# Data cleaning and missingness analysis
+
+## Data cleaning
+
+This section highlights the data cleaning methods that were used to clean the data: duplicated rows were first removed, categorical variables were transformed to factors, unusual values were analysed, before eventually being changed to NAs.
+
+### Duplicated rows
+
+There are `r sum(duplicated(data))` duplicated rows in the original dataset. They were removed from the dataset in its clean version.
+
+```{r remove_duplicates}
+data.cleaned <- data |>
+  distinct()
+
+```
+
+
+
+
+### Unusual values
+
+Unusual values were then dealt with.
+
+As mentioned in the first question, `Acousticness`, `Tempo` and `Duration_ms` contain unusual values.
+
+The values outside the 0 - 1 range in the `Acousticness` are impossible according to the definition of the variable. These values were therefore transformed to missing values.
+
+`Duration_ms` also had unlikely high values (either really small values of really high values)
+
+```{r duration_analysis}
+small_duration <- data.cleaned |>
+  select(Duration_ms, song_name) |>
+  arrange(Duration_ms) |>
+  slice_head(n=10)
+
+high_duration <- data.cleaned |>
+  select(Duration_ms, song_name) |>
+  arrange(desc(Duration_ms)) |>
+  slice_head(n=10)
+  
+unlikely_duration <- bind_rows(high_duration, small_duration)
+
+knitr::kable(unlikely_duration)
+
+```
+The table above summarises the top and bottom ten songs for duration in the dataset. The unusually long songs are actually speeches or just very long songs after verification. Their duration were kept as is in the dataset. The negative values for duration are impossible and were therefore replaced by missing values. The unusually small values (the smallest positive values for duration are less than 30 seconds long) seem to actually be introduction songs, and were therefore not changed in the cleaned dataset.
+
+`Tempo` also had unlikely high and low values.
+
+```{r tempo_analysis}
+small_tempo <- data.cleaned |>
+  select(Tempo, song_name) |>
+  arrange(Tempo) |>
+  slice_head(n=15)
+
+high_tempo <- data.cleaned |>
+  select(Tempo, song_name) |>
+  arrange(desc(Tempo)) |>
+  slice_head(n=5)
+  
+unlikely_tempo <- bind_rows(high_tempo, small_tempo)
+
+knitr::kable(unlikely_tempo)
+```
+There are quite a lot of songs that have a negative or null tempo. These song tempos were replaced by missing values in the cleaned dataset. The song that has the highest tempo in the dataset has a tempo of more than 240 beats per minutes (meaning around 4 beats per seconds). That seems quite high, but not completely impossible, the highest values were kept as they were.
+
+The repartition of the variable `Time_signature` also differs from the description that was given, as the values currently range from 0 to 5 when they were supposed to be between 3 and 7.
+
+```{r time_sig_analysis}
+time_signature <- data.cleaned |>
+  filter(Time_signature == 0 | Time_signature == 1) |>
+  select(song_name, Time_signature)
+
+knitr::kable(head(time_signature))
+  
+```
+The songs on the table above have a time signature marked as 0 or 1 in the dataset, but actually have a time signature of 4 (according to internet researches). It was therefore concluded that time signatures of 0 or 1 in the dataset were actually missing values.
+
+The next chunk of code cleans the data as was highlighted before.
+
+```{r cleaning}
+data.cleaned <- data.cleaned |>
+  mutate(Acousticness=replace(Acousticness,
+                              (Acousticness < 0) | (Acousticness > 1),
+                              NA),
+         Tempo=replace(Tempo,
+                       Tempo <= 0,
+                       NA),
+         Duration_ms=replace(Duration_ms,
+                             Duration_ms < 0,
+                             NA),
+         Time_signature=replace(Time_signature,
+                                (Time_signature == 0) | (Time_signature == 1),
+                                NA))
+
+```
+
+
+### Categorical variables
+
+
+The feature `Audio_mode` is a categorical variable. It was therefore transformed into a factor.
+
+```{r}
+data.cleaned$Audio_mode <- as.factor(data.cleaned$Audio_mode)
+```
+
+The features `Key` and `Time_signature` are ordinal variables. They also have to be transformed into factors to be appropriately dealt with later.
+
+```{r}
+data.cleaned$Key <- as.factor(data.cleaned$Key)
+data.cleaned$Time_signature <- as.factor(data.cleaned$Time_signature)
+```
+
+
+Finally, the feature `song_name` was removed, as it was just useful to identify songs. 
+
+```{r}
+data.final <- data.cleaned |> select(-song_name)
+```
+
+## Discussing missingness
+
+### Overview of the missingness
+
+A missing variables summary was created to have an idea of the proportion of missing data in each column.
+
+```{r miss_var_summary}
+knitr::kable(miss_var_summary(data.final))
+
+```
+
+The table above shows the amount of missing values in the dataset. `Energy` is the variable with the most missing values, with around 8.5% of missing values, followed by `Acousticness` that has 6.2% of missing values. `song_popularity` and `Audio_mode` are the only features with no missing data. All other features have around 5% of missing data (around 650 rows have missing data).
+
+An upset plot was then created to understand the missingness in the dataset better.
+
+```{r miss_upset, warning=FALSE, message=FALSE}
+gg_miss_upset(data.final, nsets=ncol(data.final)-2)
+```
+There are more than 5000 rows (out of `r nrow(data.cleaned)`) that have missing values. Most rows having missing values only have one missing value, there are no rows with more than two missing values. It does not seem like there are any correlations between one column having missing values and other values missing (there is no particular combination of columns with a high number of missing values).
+
+### Type of missingness
+
+The type of missingness in the dataset will now be discussed.
+
+Little's test is first used to investigate whether the missing data is missing completely at random.
+
+```{r mcar_test}
+knitr::kable(mcar_test(data.final))
+```
+The table above summarises the results of Little's test on our dataset. The p-value of the test is extremely close to 0, indicating strong evidence against MCAR. We therefore reject the null hypothesis that the missing data in the data is missing completely at random.
+
+In general, it seems probable that the missingness in the dataset is related to the values of other audio features in the dataset.
+
+ - `Tempo`, `Key` and `Time_signature` : these features are objective musical measures. For these variables, the missingness can be related to `Speechiness` (if the track is not a song but a speech, it makes sense that there is no value for these features, so higher values of `Speechiness` may influence the missingness in these three features),
+ 
+ - `Duration_ms`, `Loudness` : these features are objective measures in a song. These features might be missing because of `song_popularity`. Unpopular songs that might be particularly old would be more likely to have these features missing, as they were not calculated, and, therefore, could not be extracted.
+
+ - `Energy`, `Acousticness`, `Audio_valence`, `Danceability`, `Liveness` and `Speechiness`, `Instrumentalness`: these features are not directly measured in the songs, they describe how a song feels to someone listening. For these variables, the missingness can be related to `song_popularity` (less popular songs are more likely to have missing values because they are less popular), `Speechiness` (if the speechiness value is high, indicating that the track might be a podcast or speech, it is more likely that values would be missing, as it is hard to evaluate the values of the other features in this category) or again `Liveness` (for songs performed live, that would therefore have higher values for liveness, it might be harder to calculate the values of the other features in this category)
+
+It seems plausible that the missingness in the dataset is related to the values of other variables in the dataset. That would mean that the data missing is missing at random (MAR).
+
+
+```{r missing_scatterplots, warning=FALSE, message=FALSE, fig.height=30, fig.width=30}
+# original distribution of the variable
+og_plot <- data.final |>
+  ggplot() +
+  geom_histogram(aes(x=song_popularity), alpha=0.5, fill="purple") +
+  labs(title="Distribution of the original variable",
+       x="Song popularity")
+
+# function that plots the popularity for missing values
+plot.missing.pop <- function(feature.name) {
+  nrgy_plot <- data.final |>
+  filter(is.na(.data[[feature.name]])) |>
+  ggplot() +
+  geom_histogram(aes(x=song_popularity), alpha=0.5, fill="purple") +
+  labs(title=paste(feature.name, " missing"),
+       x="Song popularity")
+}
+
+nrgy_plot <- plot.missing.pop("Energy")
+acous_plot <- plot.missing.pop("Acousticness")
+valence_plot <- plot.missing.pop("Audio_valence")
+dance_plot <- plot.missing.pop("Danceability")
+live_plot <- plot.missing.pop("Liveness")
+speech_plot <- plot.missing.pop("Speechiness")
+instru_plot <- plot.missing.pop("Instrumentalness")
+
+(og_plot + nrgy_plot) / (acous_plot + valence_plot) / (dance_plot + live_plot) / (speech_plot + instru_plot) 
+```
+
+
+
+The plot above shows the difference in distribution between the original song popularity variable and the song popularities of songs having the variables of the last group missing. In general, it seems that the popularity when there is missing data is not that different from the original distribution, even though. The only flagrant effect is with missing values in `Energy`, where missing values seem to be linked to low song popularity. For the other variables in the group, it seems like tracks with missing values may be slightly less popular, the distributions seem to be more spread between 0 and 100 (the peak between 50 and 75 is less pronounced, and there are more datapoints with a low song popularity) : this seems to be the case for `Acousticness`, `Audio_valence` and `Danceability`. `Speechiness` has a peak higher than normal for songs with a popularity close to 0.
+
+```{r missing_scatterplots_3, warning=FALSE, message=FALSE}
+# original distribution of the variable
+og_plot <- data.final |>
+  filter(Speechiness < 0.6) |> # removing unusually high values to have comparable plots
+  ggplot() +
+  geom_histogram(aes(x=Speechiness), alpha=0.5, fill="purple") +
+  labs(title="Distribution of the original variable",
+       x="Speechiness")
+
+# function that plots the popularity for missing values
+plot.missing.speech <- function(feature.name) {
+  nrgy_plot <- data.final |>
+  filter(is.na(.data[[feature.name]])) |>
+  ggplot() +
+  geom_histogram(aes(x=Speechiness), alpha=0.5, fill="purple") +
+  labs(title=paste(feature.name, " missing"),
+       x="Speechiness")
+}
+
+key_plot <- plot.missing.speech("Key")
+signature_plot <- plot.missing.speech("Time_signature")
+tempo_plot <- plot.missing.speech("Tempo")
+
+
+(og_plot + key_plot) / (signature_plot + tempo_plot)
+```
+The plot above shows the difference in distribution between the original speechiness variable and the speechiness of songs having the variables of the first group missing. It seems like there is a slightly higher density for higher values of speechiness for distribution where variables are missing. However, again, this is not flagrant.
+
+From these two plots, it seems like the missing data are missing at random, but that the missingness is not related to just one other variable, but to multiple other audio features present in the dataset, making it hard to visualise.
+
+## Imputing the missing data
+
+As assessed previously, there is around 5% of missing data for most features that have missing data and it is plausible that the data missing is missing at random. Therefore, using multivariate imputation chained equations (MICE) is the best option. For continuous numerical variables (`Energy`, `Acousticness`, `Duration_ms`, `Tempo`, `Audio_valence`, `Loudness`, `Instrumentalness`, `Speechiness`, `Danceability` and `Liveness`), predictive mean matching was used to impute missing data. For the two other variables with missing values (`Key` and `Time_signature`), multinomial logistic regression was used, as they are categorical variables with more than one category. The algorithm was run for 15 iterations, in order to make sure convergence was reached and 15 datasets were imputed, in order to combine a high number of datasets to choose from at a lower computational cost.
+
+
+
+```{r mice, warning=FALSE, message=FALSE}
+imp.mice <- mice(data.final,
+                 m=15,
+                 maxit=15,
+                 printFlag=FALSE,
+                 seed=seed)
+```
+
+## Assessing the performance of the imputation
+
+### Convergence
+
+Convergence was checked, using trace plots for numerical variables. The plots for Energy and Liveness are plotted here for reference, but all trace plots were investigated, and the same conclusions were reached on all plots.
+
+```{r}
+plot(imp.mice,
+     y=c("Energy", "Liveness"))
+```
+
+On these two plots, the mean and the standard deviation of the chosen variable in every imputed datasets seem to be stable across the iterations and the datasets. There is no trend in any trace plot, confirming that the model has converged.
+
+### Quality of the imputation
+
+A linear regression model of `song_popularity` against all other variables in the dataset was fitted for each imputed dataset and the results were then pooled to assess the overall quality of imputation. The pooled r-squared was calculated to assess the goodness of fit of the linear regression across all datasets.
+
+```{r pooled_r_squared}
+reg.models <- with(imp.mice,
+                        lm(song_popularity~Energy+Acousticness+Duration_ms+Danceability+
+                             Instrumentalness+Key+Loudness+Speechiness+
+                             Tempo+Time_signature+Audio_valence+
+                             Audio_mode+Liveness))
+
+pool.r2 <- pool.r.squared(reg.models, adjusted=TRUE)
+knitr::kable(pool.r2)
+```
+The pooled adjusted R-squared is `r pool.r2[[1]]`, meaning that the linear regression model explains 3.78% of the variance in the target variable `song_popularity`. This is a very poor performance, but is equal to the adjusted R-squared obtained when running linear regression on the original data (minus rows containing missing data).
+
+The assumptions of linear regression were then checked for two of the linear regression model that were fitted on the imputed datasets.
+
+
+```{r mice_assumption_check_lr}
+par(mfrow = c(2, 2))
+plot(reg.models$analyses[[2]])
+```
+
+
+```{r mice_assumption_check_lr2}
+par(mfrow = c(2, 2))
+plot(reg.models$analyses[[5]])
+```
+
+For all of these models, the residuals seem to be evenly distributed (as can be seen on the Residuals vs Fitted values plots), except maybe for low fitted values of popularity, that seem to have higher positive residuals. Both QQ-plots show that the residuals are slightly left-skewed, contradicting the normality assumption (even though there are a lot of data points, meaning that this should not be too concerning). The scale-location plots show no trend, confirming the homoscedasticity of the residuals. Overall, the assumptions of linear regression are checked for both of these models (there could be slight violation in the normality assumption though).
+
+```{r choose_dataset}
+r2.perdataset <- sapply(reg.models$analyses, function(fit) {
+  summary(fit)$r.squared
+})
+print(r2.perdataset)
+```
+
+The eleventh imputed dataset has the highest r squared, this is the one that was chosen for further analysis.
+
+```{r final_dataset}
+data.complete <- complete(imp.mice, 11)
+summary(data.complete)
+```
+The output above shows the summary statistics of all imputed variables, to make sure the imputation has been carried out correctly. There is no value out of the ranges that were described in the definitions of the dataset, it seems that the imputation has been done correctly.
+
+```{r save_cleaned_dataset, include=FALSE, message=FALSE, warning=FALSE}
+
+write.csv(data.complete, "Song_cleaned.csv", row.names=FALSE)
+
+
+```
+
+
+
+# Developping an ensemble model
+
+```{r ml_setup}
+plan(multisession, workers = 2)
+registerDoFuture()
+```
+
+
+An ensemble model was developed to predict the popularity of a song based on audio features. 5 different models were integrated in the final ensemble model : linear regression, a support vector machine, an artificial neural network, a random forest and a gradient boosting model.
+
+The data was split into a training and a testing dataset using stratified sampling. The training dataset was then partitioned in 5 different parts for cross-validation.
+
+```{r splitting_data}
+set.seed(seed)
+song_split <- initial_split(data.complete, strata = song_popularity)
+song_train <- training(song_split)
+song_test  <-  testing(song_split)
+
+song_folds <- vfold_cv(song_train, v = 5)
+```
+
+
+## Feature preprocessing
+
+The feature preprocessing reasoning is described here.
+
+```{r time_signature_repartition}
+
+knitr::kable(table(data.complete$Time_signature))
+
+```
+
+
+The feature `Time_signature` is categorical and is equal to 4 for around 95% of the rows in the dataset. As this feature is not informative for any model, it was removed from the list of predictors.
+
+
+The skewness statistics are calculated on all numerical variables.
+
+```{r skewness, warning=FALSE, message=FALSE}
+numerical_variables <- c("Energy", "Acousticness", "Audio_valence", "Duration_ms", "Danceability", "Liveness", "Speechiness", "Instrumentalness", "song_popularity")
+
+skew.df <- sapply(select(data.complete, numerical_variables),
+                  skewness)
+
+knitr::kable(skew.df)
+
+```
+
+
+The distributions of the features `Audio_valence`, and `Danceability` are roughly symmetrical, no preprocessing was needed for these features.
+
+`Energy`, `Liveness` and `Speechiness` are skewed : `Energy` is moderately left skewed while both `Liveness` and `Speechiness` are heavily right-skewed. Yeo-Johnson transformation will be applied to these variables to make them normal.
+
+`Duration_ms` has the highest skewness statistic (4.58), indicating strong skewness. That is, however, due to just a few outliers that were investigated before. No preprocessing was therefore applied to this feature.
+
+
+`Instrumentalness` has a high peak around 0 and another (much smaller one) around 1 : this variable was transformed into a categorical variable (0 : there are lyrics, 1 : the song is instrumental with a low threshold).
+
+
+3 different recipes were used for the models.
+
+- For SVM, neural network and XGBoost : SVMs and neural networks require normal numerical predictors normalized inputs and encoded categorical features. XGBoost only requires encoded categorical features, but as this was a recipe in which categorical features were properly encoded, it was also used for XGBoost. The skewed features (`Energy`, `Acousticness`, `Liveness`, `Loudness` and `Speechiness`) were transformed using yeo-johnson transformation, in order for these features' distributions to be roughly normal. As discussed before, `Instrumentalness` was transformed into a categorical variable. Categorical variables (`Instrumentalness`, `Key` and `Time_signature`) were then one-hot encoded.
+
+- For linear regression : a polynomal step was added to the normalized recipe described before
+
+- For random forest : this model does not require normalization of numerical features or a specific handling of categorical features. No specific pre-processing has been used for this model.
+
+```{r recipes}
+
+normalized_rec <- rec_normalized <- recipe(song_popularity~Audio_valence+Duration_ms+Danceability+
+                                             Energy+Liveness+Speechiness+Instrumentalness+
+                                             Key+Audio_mode+Tempo+Loudness+Acousticness, data=song_train) |>
+  step_YeoJohnson(Energy) |>
+  step_YeoJohnson(Liveness) |>
+  step_YeoJohnson(Speechiness) |>
+  step_YeoJohnson(Acousticness) |>
+  step_YeoJohnson(Loudness) |>
+  step_cut(Instrumentalness, breaks=c(0, 0.5, 1))|>
+  step_dummy(all_nominal_predictors()) |>
+  step_normalize(all_predictors())
+
+poly_rec <- normalized_rec |>
+  step_poly(Energy, Liveness, Speechiness, Audio_valence, Duration_ms, Danceability, Tempo, Acousticness, Loudness) |>
+  step_interact(~all_predictors():all_predictors())
+
+noprepro_rec <- recipe(song_popularity~Audio_valence+Duration_ms+Danceability+
+                                             Energy+Liveness+Speechiness+Instrumentalness+
+                                             Key+Audio_mode+Tempo+Loudness+Acousticness, 
+              data=song_train)
+```
+
+## Model specifications
+
+Each model was then defined and specified. 
+
+For linear regression, the regularization parameters were tuned : the `penalty` parameter, that controls the total amount of regularization applied in the model and the `mixture` parameter, that controls the proportion of l1 (lasso) regularization in the model (with 1 being only l1 regularization and 0 being only l2 (ridge) regularization).
+
+For the neural network model, the number of hidden units (in the single layer), the weight decay and the number of epochs were tuned.
+
+For the gradient boosting algorithm, the parameters tuned were the following : the number of parameters randomly sampled at each split in the tree models, the minimum number of data points in a node for it to be split, the total number of trees in the model, the learning rate, the maximum depth of each tree in the algorithm, the minimum loss reduction required for a new node to be created and the depth of the trees in the models.
+
+For the support vector machine, the cost parameter (that controls the cost of having a prediction in or on the wrong side of the margin) and the radial basis function parameter were tuned.
+
+Finally for the random forest, the number of parameters randomly sampled at each split in the tree models, the minimum number of data points in a node for it to be split and the total number of trees in the model were tuned
+
+```{r models}
+linear_reg_spec <- 
+  linear_reg(penalty = tune(), 
+             mixture = tune()) |>
+  set_engine('glmnet')
+
+nnet_spec <-
+  mlp(hidden_units = tune(), 
+      penalty = tune(), 
+      epochs = tune()) |>
+  set_engine('nnet') |>
+  set_mode('regression')
+
+tree_spec <-
+  boost_tree(mtry  = tune(), 
+             min_n = tune(), 
+             trees = tune(),
+             learn_rate = tune(),
+             loss_reduction=tune(),
+             tree_depth=tune()) |>
+  set_engine('xgboost') |>
+  set_mode('regression')
+
+svm_r_spec <- 
+  svm_rbf(cost = tune(), 
+          rbf_sigma = tune()) |>
+  set_engine('kernlab') |>
+  set_mode('regression')
+
+rf_spec <-
+  rand_forest(mtry = tune(), 
+              min_n = tune(), 
+              trees = tune()) |>
+  set_engine('ranger') |>
+  set_mode('regression')
+
+```
+
+
+The parameters ranges were then updated.
+
+```{r update_param}
+N_feature = ncol(song_train) - 1
+
+# Specifying the neural network model parameter range
+nnet_param <-
+  nnet_spec |>
+  extract_parameter_set_dials() |>
+  update(hidden_units = hidden_units(c(10, 500)))
+
+# Specifying the random forest model parameter range
+rf_param <-
+  rf_spec |>
+  extract_parameter_set_dials() |>
+  update(
+    mtry  = mtry(c(1, N_feature)),
+    trees = trees(c(500, 2000)),
+    min_n = min_n(c(1, 100))
+  )
+
+# Specifying the XGBoost model parameter range
+BRT_param <-
+  tree_spec |>
+  extract_parameter_set_dials() |>
+  update(
+    mtry  = mtry(c(1, N_feature)),
+    trees = trees(c(500, 5000)),
+    min_n = min_n(c(1, 100),),
+    learn_rate = learn_rate(c(0.0001, 0.5))
+  )
+
+# Specifying the SVM model parameter range
+svm_r_param <-
+  svm_r_spec |>
+  extract_parameter_set_dials() |>
+  update(cost = cost(c(-3, 2)))
+
+```
+
+
+Each workflow sets were then created.
+
+```{r workflow_set}
+
+# Creating the workflow set for normalized models (SVM, neural network and linear regression)
+normalized <-
+  workflow_set(
+    preproc = list(normalized = normalized_rec),
+    models  = list(SVM_radial = svm_r_spec,
+                   nnet       = nnet_spec,
+                   BRT        = tree_spec)
+  )
+
+# Creating the workflow set for linear regression
+poly <- workflow_set(
+  preproc=list(poly = poly_rec),
+  models=list(linear_reg = linear_reg_spec)
+)
+
+# Creating the workflow set for models that do not require pre-processing (random forest)
+no_pre_proc <-
+  workflow_set(
+    preproc = list(simple = noprepro_rec),
+    models = list(RF = rf_spec)
+  )
+
+
+```
+
+
+The parameter ranges were updated in each workflow.
+
+```{r update_param_workflow_set}
+# Updating parameter range for neural network model
+normalized %<>%
+  option_add(param_info = nnet_param, 
+             id = 'normalized_nnet') |>
+  option_add(param_info = BRT_param,
+             id = 'normalized_BRT') |>
+  option_add(param_info = svm_r_param,
+             id = 'normalized_SVM_radial')
+
+# Updating parameter range for random forest and for XGBoost
+no_pre_proc %<>% 
+  option_add(param_info = rf_param,  
+             id = 'simple_RF') 
+
+
+```
+
+
+Finally, all three workflows were combined.
+
+```{r bind_all_workflow}
+all_workflows <-
+  bind_rows(no_pre_proc, normalized, poly) |>
+  mutate(wflow_id = gsub('(simple_)|(normalized_)', '', wflow_id))
+
+```
+
+
+## Parameter tuning
+
+Racing grid search was then applied to the workflow to find the optimal hyperparameters for each model. For each model, 20 different combinations of hyperpaameters were tested (meaning that 20 different models were fitted).
+
+```{r race, warning=FALSE, message=FALSE}
+race_ctrl <- 
+  control_race(
+    save_pred = TRUE,
+    parallel_over = 'everything',
+    save_workflow = TRUE
+  )
+
+race_results <-
+  all_workflows %>%
+  workflow_map(
+      'tune_race_anova',
+      seed      = seed,
+      resamples = song_folds,
+      grid      = 20,
+      control   = race_ctrl,
+      verbose   = TRUE
+    )
+
+```
+
+
+
+Here is a comparison of the results for each model : 
+
+```{r rank_model}
+autoplot(
+  race_results,
+  rank_metric = 'rmse',
+  metric = 'rmse', 
+  select_best = TRUE 
+) +
+  geom_text(aes(y = mean - 1/2, label = wflow_id), angle = 90, hjust = 1) +
+  #lims(y = c(0.065, 0.095)) +
+  theme(legend.position = 'none') +
+  theme_light()
+
+```
+
+For all models, the root mean squared error is around 20, which is quite bad, as it means the average distances between the predicted popularities and the actual values are close to 20 (which is a lot on the scale of 0 to 100 used in this dataset). The random forest performs the best, followed by gradient boosting: tree based ensemble models are the best models. This is coherent, as they are able to handle complex relationships between variables. The model that has the worst results is neural network, which is not surprising as the dataset is not very large compared to datasets on which neural network models are usually trained.
+
+
+
+```{r compare_single}
+# for random forest
+rf_results <-
+  race_results %>%
+  extract_workflow_set_result('RF') %>%
+  select_best(metric = 'rmse')
+
+RF_test_results <-
+  race_results %>%
+  extract_workflow('RF') %>%
+  finalize_workflow(rf_results) %>%
+  last_fit(split = song_split)
+
+# gradient boosting
+brt_results <-
+  race_results %>%
+  extract_workflow_set_result('BRT') %>%
+  select_best(metric = 'rmse')
+
+BRT_test_results <-
+  race_results %>%
+  extract_workflow('BRT') %>%
+  finalize_workflow(brt_results) %>%
+  last_fit(split = song_split)
+
+# svm
+svm_results <-
+  race_results %>%
+  extract_workflow_set_result('SVM_radial') %>%
+  select_best(metric = 'rmse')
+
+svm_test_results <-
+  race_results %>%
+  extract_workflow('SVM_radial') %>%
+  finalize_workflow(svm_results) %>%
+  last_fit(split = song_split)
+
+# linear regression
+lr_results <-
+  race_results %>%
+  extract_workflow_set_result('poly_linear_reg') %>%
+  select_best(metric = 'rmse')
+
+lr_test_results <-
+  race_results %>%
+  extract_workflow('poly_linear_reg') %>%
+  finalize_workflow(lr_results) %>%
+  last_fit(split = song_split)
+
+# neural network
+nnet_results <-
+  race_results %>%
+  extract_workflow_set_result('nnet') %>%
+  select_best(metric = 'rmse')
+
+nnet_test_results <-
+  race_results %>%
+  extract_workflow('nnet') %>%
+  finalize_workflow(nnet_results) %>%
+  last_fit(split = song_split)
+
+brt_metrics <- collect_metrics(BRT_test_results)
+rf_metrics <- collect_metrics(RF_test_results)
+svm_metrics <- collect_metrics(svm_test_results)
+lr_metrics <- collect_metrics(lr_test_results)
+nnet_metrics <- collect_metrics(nnet_test_results)
+
+model.comparison <- bind_rows(
+  brt_metrics |> mutate(model="BRT"),
+  rf_metrics |> mutate(model="RF"),
+  svm_metrics |> mutate(model="SVM"),
+  lr_metrics |> mutate(model="LR"),
+  nnet_metrics |> mutate(model="NNET")
+) |>
+  pivot_wider(names_from=.metric, values_from=.estimate) |>
+  select(model, rmse, rsq)
+
+model.comparison
+
+```
+
+The table above summarises the RMSE and R squared of each of the best models. The best model is a random forest model with a root mean square error of 19.1 and a R squared of around 0.20. The next best model is a gradient boosting model, that has a slightly higher root mean square error (19.2). The next two best models are one SVM and one linear regression, with RMSE of 20.5 and 21.0. Finally, the worst model is the neural network model, with a RMSE of 21.5.
+
+The best R squared value (random forest) is greater than 0.20, meaning that the best single models explain slightly more than 20% of the variation in `song_popularity`, while the worst models (neural network and linear regression) only explains around 4% of the variation in the target variable. 
+
+## Ensemble model 
+
+A stacking model was then fitted. The candidates of the stacking model are the models that were previously tuned.
+
+```{r stacking, warning=FALSE, message=FALSE}
+
+song_stack <- 
+  stacks() %>%
+  add_candidates(race_results)
+
+```
+A regularized model was fitted, with values of l1 regularization ranging between \(10^{-6}\) and \(10^{-1}\).
+
+```{r lasso}
+set.seed(seed)
+
+ens <- blend_predictions(song_stack)
+
+autoplot(ens)
+
+```
+
+The plot above shows the mean values of root mean squared error and r squared for each value of the regularization parameter that was tried. From this plot, he best values for this parameter is 0.01.
+
+
+```{r models_ens, warning=FALSE, message=FALSE}
+ens
+```
+
+The output above shows the models that were taken into account in the final ensemble model. The three best models that were described before were used in the ensemble model with the following weights : 0.74 for the best random forest model, 0.29 for the second best random forest model and 0.18 for the best gradient boosting model.
+
+The ensemble model was finally fitted.
+
+```{r fit_member, message=FALSE, warning=FALSE}
+ens <- fit_members(ens)
+```
+
+```{r save_ensemble, include=FALSE, message=FALSE, warning=FALSE}
+
+saveRDS(ens, "song_ensemble.rds")
+
+```
+
+
+```{r compare_ensemble_best}
+reg_metrics <- metric_set(rmse, rsq)
+ens_test_pred <- 
+  predict(ens, song_test) %>%
+  bind_cols(song_test)
+
+knitr::kable(ens_test_pred %>%
+  reg_metrics(song_popularity, .pred))
+
+
+```
+
+The table above shows the metrics of the final fitted ensemble model. The root mean squared error on the test dataset is 19.0 (0.13 lower than the best single models, that had a RMSE of 19.13) and the r squared is 0.213 (which, again, is slightly better than the r squared for the single models). Roughly 21.3% of the variations in the popularity of a song are explained by the model, which is an increase of almost 1% compared to the best single model (random forest).
+
+
+
+
+
+
+## Output interpretation
+
+To be able to interpret the model's output, several feature importance plots were produced based on the `explain_tidymodels` function.
+
+```{r explain_ensemble}
+vip_features <- normalized_rec$var_info$variable
+
+vip_train <- 
+  song_train %>% 
+  select(all_of(vip_features))
+
+explainer_ens <- 
+  explain_tidymodels(
+    ens, 
+    data = vip_train |> select(-song_popularity), 
+    y = song_train |> select(song_popularity),
+    label = "Ensemble",
+    verbose = FALSE
+)
+
+```
+
+General feature importance was calculated at first. To get the importance of one feature, the observation for this feature are randomly shuffled multiple times, and the difference in root mean square error was calculated.
+
+```{r variable_imp}
+model_parts_ens <- model_parts(explainer_ens)
+plot(model_parts_ens)
+```
+
+The plot above shows the results of the permutations method. `Loudness` is the most important feature in the model, with a RMSE loss around 14 after permutations. `Energy`, `Danceability`,  `Audio_valence`  `Instrumentalness` and `Acousticness` are the next most important features in the model. The least important features in the model are `Key` and `Audio_mode`.
+
+
+Local dependence profiles were plotted for a few of the most important features in the dataset.
+
+```{r LDP}
+adp <- model_profile(
+  explainer_ens,
+  type = 'conditional',
+  N = 100,
+  variables = c("Loudness", "Energy", "Danceability", "Acousticness")
+)
+plot(adp)
+```
+
+Overall, acousticsness has a negative impact on the prediction of song popularity, higher acousticness means lower song popularity predictions. More precisely, the predictions are stable when acousticness is low (between 0 and 0.2), before decreasing suddenly for values of acousticness between 0.2 and 0.4. The average predicted song popularity is stable / slightly decreases for values of acousticness greater than 0.4.
+
+As energy increases from 0 to around 0.75, the average predicted song popularity increases. When energy keeps increasing, the average predicted song popularity sinks down, to reach a predicted song popularity of 44. This means that Energy has a positive impact on song popularity between 0 and 0.75, and negatively impacts the precisions for values of energy higher than 0.75.
+
+As loudness increases (and all other variables are fixed), the average predictions start by getting lower, before getting higher and reaching a peak just before 0. After this peak, the song popularity decreases. This sudden decrease was expected, it seems to match the decrease in song popularity for higher values of energy (as the two variables are highly correlated, it would be expected that their plots would look similar).
+
+Danceability has a positive impact on the popularity of a song. It seems that higher danceability imply higher predictions from the model.
+
+Overall, songs with high predicted popularity are loud and energetic songs, with values of loudness between -5 dB and 0 dB and values of Energy between 0.6 and 0.75. Popular songs are easy to dance to and not acoustic songs in general.
+
